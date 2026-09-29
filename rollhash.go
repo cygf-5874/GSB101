@@ -1,7 +1,7 @@
 // Package rollhash 是文本上的重复子串索引库。
 //
-// 对外 API 与语义逐条写在 README 的「对外契约」一节里。本文件是既有实现：
-// 功能正确，但每次查找都在做逐字节回溯。
+// 对外 API 与语义逐条写在 README 的「对外契约」一节里。
+// 实现使用滚动哈希筛选候选，哈希命中后逐字节复核。
 package rollhash
 
 // Idx 是文本上建好的一版索引。内部表示完全自由，可以新增字段与方法。
@@ -25,20 +25,27 @@ func Index(text string, k int) *Idx {
 // pat 为空、pat 比文本长、或索引为空时返回空切片。
 func (ix *Idx) Lookup(pat string) []int {
 	out := []int{}
-	t := ix.text
-	if pat == "" || len(pat) > len(t) {
+	if ix.gram <= 0 {
 		return out
 	}
-	for i := 0; i+len(pat) <= len(t); i++ {
-		j := 0
-		for ; j < len(pat); j++ {
-			stats.Comparisons++
-			if t[i+j] != pat[j] {
-				break
-			}
+	t := ix.text
+	m := len(pat)
+	if m == 0 || m > len(t) {
+		return out
+	}
+
+	leading := hashLeading(m)
+	patHash := hashWindow(pat, 0, m)
+	windowHash := hashWindow(t, 0, m)
+	last := len(t) - m
+
+	for start := 0; start <= last; start++ {
+		if windowHash == patHash && sameWindow(t, start, pat, 0, m) {
+			out = append(out, start)
 		}
-		if j == len(pat) {
-			out = append(out, i)
+		if start < last {
+			windowHash = slideWindow(windowHash, t[start], t[start+m], leading)
+			stats.HashOps++
 		}
 	}
 	return out
@@ -53,17 +60,56 @@ func (ix *Idx) DupPairs(k int) [][2]int {
 		return out
 	}
 	t := ix.text
-	for i := 0; i+2*k <= len(t); i++ {
-		j := 0
-		for ; j < k; j++ {
-			stats.Comparisons++
-			if t[i+j] != t[i+k+j] {
-				break
-			}
-		}
-		if j == k {
-			out = append(out, [2]int{i, i + k})
+	n := len(t)
+	if n-k < k {
+		return out
+	}
+
+	windowCount := n - k + 1
+	hashes := make([]uint64, windowCount)
+	leading := hashLeading(k)
+	hashes[0] = hashWindow(t, 0, k)
+
+	for start := 1; start < windowCount; start++ {
+		hashes[start] = slideWindow(hashes[start-1], t[start-1], t[start+k-1], leading)
+		stats.HashOps++
+	}
+
+	for start := 0; start+2*k <= n; start++ {
+		if hashes[start] == hashes[start+k] && sameWindow(t, start, t, start+k, k) {
+			out = append(out, [2]int{start, start + k})
 		}
 	}
 	return out
+}
+
+func hashWindow(s string, start, length int) uint64 {
+	var h uint64
+	for i := 0; i < length; i++ {
+		h = (h*hashBase + uint64(s[start+i])) & hashMask
+	}
+	stats.HashOps++
+	return h
+}
+
+func slideWindow(h uint64, oldByte, newByte byte, leading uint64) uint64 {
+	return ((h-uint64(oldByte)*leading)*hashBase + uint64(newByte)) & hashMask
+}
+
+func hashLeading(length int) uint64 {
+	leading := uint64(1)
+	for i := 0; i < length-1; i++ {
+		leading = (leading * hashBase) & hashMask
+	}
+	return leading
+}
+
+func sameWindow(a string, aStart int, b string, bStart, length int) bool {
+	for i := 0; i < length; i++ {
+		stats.Comparisons++
+		if a[aStart+i] != b[bStart+i] {
+			return false
+		}
+	}
+	return true
 }
